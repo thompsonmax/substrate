@@ -78,7 +78,9 @@ type ActorWorkflow struct {
 	storageClassLister   storagev1listers.StorageClassLister
 	instruments          *Instruments
 	egressGatewayAddress string
-	pluginRegistry       VolumePluginRegistry
+	// injectEgressTrustBundle enables the policy in egresstrust.go.
+	injectEgressTrustBundle bool
+	pluginRegistry          VolumePluginRegistry
 }
 
 // NewActorWorkflow creates a new ActorWorkflow. instruments may be nil.
@@ -92,20 +94,22 @@ func NewActorWorkflow(
 	storageClassLister storagev1listers.StorageClassLister,
 	instruments *Instruments,
 	egressGatewayAddress string,
+	injectEgressTrustBundle bool,
 	pluginRegistry VolumePluginRegistry,
 ) *ActorWorkflow {
 	return &ActorWorkflow{
-		store:                store,
-		workerCache:          workerCache,
-		scheduler:            scheduling.New(workerCache, scheduling.WithMeter(otel.Meter("ateapi"))),
-		dialer:               dialer,
-		actorTemplateLister:  actorTemplateLister,
-		workerPoolLister:     workerPoolLister,
-		sandboxConfigLister:  sandboxConfigLister,
-		storageClassLister:   storageClassLister,
-		instruments:          instruments,
-		egressGatewayAddress: egressGatewayAddress,
-		pluginRegistry:       pluginRegistry,
+		store:                   store,
+		workerCache:             workerCache,
+		scheduler:               scheduling.New(workerCache, scheduling.WithMeter(otel.Meter("ateapi"))),
+		dialer:                  dialer,
+		actorTemplateLister:     actorTemplateLister,
+		workerPoolLister:        workerPoolLister,
+		sandboxConfigLister:     sandboxConfigLister,
+		storageClassLister:      storageClassLister,
+		instruments:             instruments,
+		egressGatewayAddress:    egressGatewayAddress,
+		injectEgressTrustBundle: injectEgressTrustBundle,
+		pluginRegistry:          pluginRegistry,
 	}
 }
 

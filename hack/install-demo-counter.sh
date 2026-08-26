@@ -83,3 +83,39 @@ demo-counter_delete() {
       demos/counter/counter.yaml.tmpl \
     | run_kubectl delete --ignore-not-found -f -
 }
+
+ATE_DEMOS+=(demo-counter-microvm) # register demo-counter-microvm
+
+demo-counter-microvm_cmdline() {
+  case "${1}" in
+    --deploy-demo-counter-microvm) demo-counter-microvm_deploy ;;
+    --delete-demo-counter-microvm) demo-counter-microvm_delete ;;
+    *)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# Applies only the demo manifest: assets and SandboxConfig come from
+# hack/install-microvm-deps.sh, so this can rebuild the demo on a prepared
+# cluster without the control-plane redeploy hack/run-microvm-demo.sh does.
+demo-counter-microvm_deploy() {
+  log_step "demo-counter-microvm_deploy"
+  ensure_crds
+  sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" demos/counter/counter-microvm.yaml.tmpl \
+    | run_ko apply -f -
+
+  log_step "Waiting for micro-VM counter demo to be ready..."
+  # A micro-VM golden is a cloud-hypervisor cold boot plus a checkpoint, on
+  # nested KVM in CI, so it needs a longer budget than the gVisor one above.
+  run_kubectl_fatal wait --for=condition=Ready actortemplate/counter-microvm \
+    -n ate-demo-counter-microvm --timeout=600s
+}
+
+demo-counter-microvm_delete() {
+  log_step "demo-counter-microvm_delete"
+  delete_demo_actors ate-demo-counter-microvm counter-microvm
+  sed "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" demos/counter/counter-microvm.yaml.tmpl \
+    | run_kubectl delete --ignore-not-found -f -
+}

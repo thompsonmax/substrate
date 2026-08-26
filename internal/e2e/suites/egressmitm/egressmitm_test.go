@@ -22,7 +22,9 @@ package egressmitm
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -38,8 +40,6 @@ import (
 )
 
 const probeTemplate = "probe"
-
-var probeNamespace string
 
 // TestActorEgressMITMTrust proves an actor can do TLS through the MITM
 // egress gateway using only the projected trust bundle:
@@ -58,9 +58,10 @@ var probeNamespace string
 // the passthrough gateway cluster-wide, so CI runs it as separate steps
 // after the standard lanes (see pr-workflow.yaml) — once per sandbox class,
 // since trust delivery differs per class (gVisor RO bind vs the micro-VM
-// unified virtio-fs share). Locally:
+// unified virtio-fs share). TestActorEgressTrustAutoInjection additionally
+// needs ate-api-server running --inject-egress-trust-bundle, so:
 //
-//	hack/install-ate-kind.sh --deploy-atenet --experimental-use-sdsmint
+//	hack/install-ate-kind.sh --deploy-atenet --deploy-ate-apiserver --experimental-use-sdsmint
 //	E2E_EGRESS_MITM=1 hack/run-e2e-kind.sh ./internal/e2e/suites/egressmitm -v -args --no-color
 //	E2E_EGRESS_MITM=1 E2E_SANDBOX_CLASS=microvm hack/run-e2e-kind.sh ./internal/e2e/suites/egressmitm -v -args --no-color
 //
@@ -68,7 +69,7 @@ var probeNamespace string
 // (hack/run-microvm-demo-kind.sh, or hack/install-microvm-deps.sh --install).
 func TestActorEgressMITMTrust(t *testing.T) {
 	if os.Getenv("E2E_EGRESS_MITM") == "" {
-		t.Skip("needs the sdsmint (MITM) egress gateway: deploy with hack/install-ate-kind.sh --deploy-atenet --experimental-use-sdsmint, then set E2E_EGRESS_MITM=1")
+		t.Skip("needs the sdsmint (MITM) egress gateway: deploy with hack/install-ate-kind.sh --deploy-atenet --deploy-ate-apiserver --experimental-use-sdsmint, then set E2E_EGRESS_MITM=1")
 	}
 	env, err := e2e.CheckEnv("BUCKET_NAME", "KO_DOCKER_REPO")
 	if err != nil {
@@ -87,12 +88,12 @@ func TestActorEgressMITMTrust(t *testing.T) {
 	// missing.)
 	e2e.EnsureEgressTrustBundle(t, ctx, clients)
 
-	probeNamespace = e2e.DeployProbe(t, env["BUCKET_NAME"], "egressmitm", e2e.WithTrustBundle())
-	waitForGolden(t, ctx, clients)
+	probeNamespace := e2e.DeployProbe(t, env["BUCKET_NAME"], "egressmitm", e2e.WithTrustBundle())
+	waitForGolden(t, ctx, clients, probeNamespace)
 
 	const id = "probe-mitm"
-	createAndResumeActor(t, ctx, clients, id)
-	waitForActorState(t, ctx, clients, id, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	createAndResumeActor(t, ctx, clients, probeNamespace, id)
+	waitForActorState(t, ctx, clients, probeNamespace, id, ateapipb.ActorState_ACTOR_STATE_RUNNING)
 
 	rc, err := e2e.NewRouterClient(ctx)
 	if err != nil {
@@ -111,7 +112,7 @@ func TestActorEgressMITMTrust(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Minute)
 	var pos fetchResponse
 	for {
-		pos = probeFetch(t, ctx, rc, id, origin, "bundle")
+		pos = probeFetch(t, ctx, rc, probeNamespace, id, origin, "bundle")
 		isCertErr := strings.Contains(pos.Error, "certificate") || strings.Contains(pos.Error, "x509")
 		if pos.Error == "" || !isCertErr || time.Now().After(deadline) {
 			break
@@ -125,7 +126,7 @@ func TestActorEgressMITMTrust(t *testing.T) {
 		t.Fatalf("fetch %s via projected bundle: status %s, want 200", origin, pos.Status)
 	}
 
-	neg := probeFetch(t, ctx, rc, id, origin, "system")
+	neg := probeFetch(t, ctx, rc, probeNamespace, id, origin, "system")
 	if neg.Error == "" {
 		t.Errorf("fetch with system roots unexpectedly succeeded (status %s): the minted leaf should chain to no public CA — is the sdsmint (MITM) gateway actually deployed, or is egress running in passthrough mode?", neg.Status)
 	} else if !strings.Contains(neg.Error, "certificate") && !strings.Contains(neg.Error, "x509") {
@@ -133,19 +134,152 @@ func TestActorEgressMITMTrust(t *testing.T) {
 	}
 }
 
+// TestActorEgressTrustAutoInjection deploys the probe WITHOUT WithTrustBundle,
+// so anything it reads arrived through ateapi's injection: the injected file
+// must match the published bundle (as cert sets — sanitization shuffles), and
+// TLS through the MITM gateway must complete with only those anchors.
+//
+// Needs --inject-egress-trust-bundle on ateapi as well as the sdsmint
+// gateway. Locally:
+//
+//	hack/install-ate-kind.sh --deploy-atenet --deploy-ate-apiserver --experimental-use-sdsmint
+//	E2E_EGRESS_MITM=1 hack/run-e2e-kind.sh ./internal/e2e/suites/egressmitm -v -args --no-color
+func TestActorEgressTrustAutoInjection(t *testing.T) {
+	if os.Getenv("E2E_EGRESS_MITM") == "" {
+		t.Skip("needs the sdsmint (MITM) egress gateway and injection: deploy with hack/install-ate-kind.sh --deploy-atenet --deploy-ate-apiserver --experimental-use-sdsmint, then set E2E_EGRESS_MITM=1")
+	}
+	env, err := e2e.CheckEnv("BUCKET_NAME", "KO_DOCKER_REPO")
+	if err != nil {
+		t.Fatalf("CheckEnv failed: %v", err)
+	}
+	ctx := context.Background()
+	clients := e2e.GetClients()
+
+	// Without WithTrustBundle, DeployProbe does not wait for the bundle, but
+	// under injection even this fixture's golden boot fails closed without it.
+	e2e.EnsureEgressTrustBundle(t, ctx, clients)
+
+	ns := e2e.DeployProbe(t, env["BUCKET_NAME"], "inject")
+	waitForGolden(t, ctx, clients, ns)
+
+	const id = "probe-inject"
+	createAndResumeActor(t, ctx, clients, ns, id)
+	waitForActorState(t, ctx, clients, ns, id, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+
+	rc, err := e2e.NewRouterClient(ctx)
+	if err != nil {
+		t.Fatalf("NewRouterClient: %v", err)
+	}
+	defer rc.Close()
+
+	const injectedPath = "/run/substrate/certs/egress-mitm.ate.dev.pem"
+	read := probeReadFile(t, ctx, rc, ns, id, injectedPath)
+	if read.Error != "" {
+		t.Fatalf("reading %s in the actor: %s — is ateapi running with --inject-egress-trust-bundle? (redeploy with hack/install-ate-kind.sh --deploy-ate-apiserver --experimental-use-sdsmint)", injectedPath, read.Error)
+	}
+	ctb, err := clients.K8s.CertificatesV1beta1().ClusterTrustBundles().Get(ctx, e2e.EgressTrustBundleObjectName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting ClusterTrustBundle %q: %v", e2e.EgressTrustBundleObjectName, err)
+	}
+	gotCerts := certSet(t, read.Content, injectedPath)
+	wantCerts := certSet(t, ctb.Spec.TrustBundle, "ClusterTrustBundle "+e2e.EgressTrustBundleObjectName)
+	if !maps.Equal(gotCerts, wantCerts) {
+		t.Errorf("injected bundle at %s carries %d certificate(s) that do not match the %d in ClusterTrustBundle %q", injectedPath, len(gotCerts), len(wantCerts), e2e.EgressTrustBundleObjectName)
+	}
+
+	// Same propagation-retry rationale as TestActorEgressMITMTrust.
+	const origin = "https://example.com/"
+	deadline := time.Now().Add(2 * time.Minute)
+	var pos fetchResponse
+	for {
+		pos = probeFetch(t, ctx, rc, ns, id, origin, "injected")
+		isCertErr := strings.Contains(pos.Error, "certificate") || strings.Contains(pos.Error, "x509")
+		if pos.Error == "" || !isCertErr || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+	if pos.Error != "" {
+		t.Fatalf("TLS through the MITM egress gateway with the injected trust bundle failed: %s", pos.Error)
+	}
+	if pos.Status != "200" {
+		t.Fatalf("fetch %s via injected bundle: status %s, want 200", origin, pos.Status)
+	}
+}
+
+// certSet parses every CERTIFICATE block into a set of DER bytes, the
+// comparable form of a sanitized (deduplicated, shuffled) projection.
+func certSet(t *testing.T, pemBundle, source string) map[string]bool {
+	t.Helper()
+	set := map[string]bool{}
+	rest := []byte(pemBundle)
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type == "CERTIFICATE" {
+			set[string(block.Bytes)] = true
+		}
+	}
+	if len(set) == 0 {
+		t.Fatalf("no CERTIFICATE PEM blocks in %s", source)
+	}
+	return set
+}
+
 type fetchResponse struct {
 	Status string `json:"status"`
 	Error  string `json:"error"`
+}
+
+type readFileResponse struct {
+	Content string `json:"content"`
+	Error   string `json:"error"`
+}
+
+// probeReadFile reads a file inside the actor via the probe, with the same
+// router-warmup retry as probeFetch. Probe-level read failures are results,
+// returned for the caller to assert on.
+func probeReadFile(t *testing.T, ctx context.Context, rc *e2e.RouterClient, ns, id, filePath string) readFileResponse {
+	t.Helper()
+	path := "/readfile?path=" + url.QueryEscape(filePath)
+	ref := resources.ActorRef{Atespace: ns, Name: id}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		resp, err := rc.Get(ctx, ref, path)
+		if err != nil {
+			t.Fatalf("GET %s for %q: %v", path, id, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			t.Fatalf("reading %s response for %q: %v", path, id, readErr)
+		}
+		if resp.StatusCode == http.StatusOK {
+			var out readFileResponse
+			if err := json.Unmarshal(body, &out); err != nil {
+				t.Fatalf("decoding %s response for %q: %v (body %q)", path, id, err, body)
+			}
+			return out
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("GET %s for %q: status %d, body %q", path, id, resp.StatusCode, body)
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // probeFetch asks the probe to fetch origin with the given roots mode.
 // Router-level failures are retried for up to 30s (a resume can return
 // before the route reaches the router's xDS snapshot); probe-level TLS
 // failures are results, returned for the caller to assert on.
-func probeFetch(t *testing.T, ctx context.Context, rc *e2e.RouterClient, id, origin, roots string) fetchResponse {
+func probeFetch(t *testing.T, ctx context.Context, rc *e2e.RouterClient, ns, id, origin, roots string) fetchResponse {
 	t.Helper()
 	path := "/fetch?roots=" + roots + "&url=" + url.QueryEscape(origin)
-	ref := resources.ActorRef{Atespace: probeNamespace, Name: id}
+	ref := resources.ActorRef{Atespace: ns, Name: id}
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -175,11 +309,11 @@ func probeFetch(t *testing.T, ctx context.Context, rc *e2e.RouterClient, id, ori
 // The helpers below mirror the identity suite's: fixture golden wait and a
 // self-healing actor lifecycle (actor records outlive the fixture namespace).
 
-func waitForGolden(t *testing.T, ctx context.Context, clients *e2e.Clients) {
+func waitForGolden(t *testing.T, ctx context.Context, clients *e2e.Clients, ns string) {
 	t.Helper()
 	deadline := time.Now().Add(e2e.TemplateReadyTimeout(t))
 	for time.Now().Before(deadline) {
-		at, err := clients.SubstrateK8s.ApiV1alpha1().ActorTemplates(probeNamespace).Get(ctx, probeTemplate, metav1.GetOptions{})
+		at, err := clients.SubstrateK8s.ApiV1alpha1().ActorTemplates(ns).Get(ctx, probeTemplate, metav1.GetOptions{})
 		if err == nil {
 			switch at.Status.Phase {
 			case v1alpha1.PhaseReady:
@@ -193,15 +327,15 @@ func waitForGolden(t *testing.T, ctx context.Context, clients *e2e.Clients) {
 	t.Fatalf("timed out waiting for probe ActorTemplate to be Ready")
 }
 
-func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Clients, id string) {
+func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Clients, ns, id string) {
 	t.Helper()
-	_, _ = clients.SubstrateAPI.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: probeNamespace}}})
-	ref := &ateapipb.ObjectRef{Atespace: probeNamespace, Name: id}
+	_, _ = clients.SubstrateAPI.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: ns}}})
+	ref := &ateapipb.ObjectRef{Atespace: ns, Name: id}
 	_, _ = clients.SubstrateAPI.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: ref})
 	_, _ = clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: ref})
 	if _, err := clients.SubstrateAPI.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
-		Metadata:               &ateapipb.ResourceMetadata{Atespace: probeNamespace, Name: id},
-		ActorTemplateNamespace: probeNamespace,
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: ns, Name: id},
+		ActorTemplateNamespace: ns,
 		ActorTemplateName:      probeTemplate,
 	}}); err != nil {
 		t.Fatalf("CreateActor %q: %v", id, err)
@@ -209,7 +343,7 @@ func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Client
 	t.Cleanup(func() {
 		_, _ = clients.SubstrateAPI.SuspendActor(ctx, &ateapipb.SuspendActorRequest{Actor: ref})
 		if _, err := clients.SubstrateAPI.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: ref}); err != nil {
-			t.Logf("cleanup: DeleteActor %q failed, actor leaked (remove with: kubectl ate delete actor %s -a %s): %v", id, id, probeNamespace, err)
+			t.Logf("cleanup: DeleteActor %q failed, actor leaked (remove with: kubectl ate delete actor %s -a %s): %v", id, id, ns, err)
 		}
 	})
 	if _, err := clients.SubstrateAPI.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: ref}); err != nil {
@@ -217,12 +351,12 @@ func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Client
 	}
 }
 
-func waitForActorState(t *testing.T, ctx context.Context, clients *e2e.Clients, actorName string, want ateapipb.ActorState) {
+func waitForActorState(t *testing.T, ctx context.Context, clients *e2e.Clients, ns, actorName string, want ateapipb.ActorState) {
 	t.Helper()
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		resp, err := clients.SubstrateAPI.GetActor(ctx, &ateapipb.GetActorRequest{
-			Actor: &ateapipb.ObjectRef{Atespace: probeNamespace, Name: actorName},
+			Actor: &ateapipb.ObjectRef{Atespace: ns, Name: actorName},
 		})
 		if err == nil && resp.GetStatus().GetState() == want {
 			return

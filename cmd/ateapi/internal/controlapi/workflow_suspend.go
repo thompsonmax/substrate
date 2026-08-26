@@ -234,7 +234,7 @@ func (w *ActorWorkflow) ensureAteletSuspended(ctx context.Context, actorRef reso
 	}
 	client := ateletpb.NewAteomHerderClient(ateletConn)
 
-	workloadSpec, err := workloadSpecFromActorTemplate(actorTemplate, actor)
+	workloadSpec, err := w.workloadSpec(ctx, actorTemplate, actor)
 	if err != nil {
 		return "", err
 	}
