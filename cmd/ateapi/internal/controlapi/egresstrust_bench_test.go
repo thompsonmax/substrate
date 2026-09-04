@@ -37,6 +37,10 @@ func benchSpec() *ateletpb.WorkloadSpec {
 	}
 }
 
+// benchSink keeps the baseline spec on the heap so build-spec and
+// build-spec+inject allocate alike and the difference is the injection.
+var benchSink *ateletpb.WorkloadSpec
+
 // BenchmarkInjectEgressTrustVolume: the control-plane side of
 // --inject-egress-trust-bundle, run once per spec build.
 //
@@ -47,13 +51,14 @@ func BenchmarkInjectEgressTrustVolume(b *testing.B) {
 	b.Run("build-spec", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = benchSpec()
+			benchSink = benchSpec()
 		}
 	})
 	b.Run("build-spec+inject", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := injectEgressTrustVolume(ctx, actor, benchSpec()); err != nil {
+			benchSink = benchSpec()
+			if err := injectEgressTrustVolume(ctx, actor, benchSink); err != nil {
 				b.Fatal(err)
 			}
 		}
