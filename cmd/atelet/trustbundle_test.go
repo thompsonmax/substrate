@@ -33,7 +33,7 @@ import (
 )
 
 // testCertPEM mints a throwaway self-signed certificate, PEM-encoded.
-func testCertPEM(t *testing.T) []byte {
+func testCertPEM(t testing.TB) []byte {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -51,7 +51,7 @@ func testCertPEM(t *testing.T) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-func ctbLister(t *testing.T, bundles ...*certsv1beta1.ClusterTrustBundle) certlisters.ClusterTrustBundleLister {
+func ctbLister(t testing.TB, bundles ...*certsv1beta1.ClusterTrustBundle) certlisters.ClusterTrustBundleLister {
 	t.Helper()
 	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 	for _, b := range bundles {
