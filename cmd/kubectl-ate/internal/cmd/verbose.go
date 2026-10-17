@@ -25,6 +25,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.ate.dev/substrate/internal/ateclient"
+	"go.ate.dev/substrate/internal/ateclient/ateconfig"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -75,22 +76,39 @@ func loadKubeConfig(errOut io.Writer, kubeconfigPath, contextName string) (*rest
 func newAPIClient(cmd *cobra.Command) (*ateclient.Client, error) {
 	ctx := cmd.Context()
 	errOut := cmd.ErrOrStderr()
-	warnSharedIdentity(errOut, tokenFile)
+	c, source, err := resolveAPIContext()
+	if err != nil {
+		return nil, err
+	}
+	opts := ateclient.DialOptions{
+		Kubeconfig:  kubeconfig,
+		KubeContext: k8sContext,
+		TokenFile:   tokenFile,
+		Trace:       traceEnabled,
+		GRPCOptions: []grpc.DialOption{grpc.WithChainUnaryInterceptor(newLoggingUnaryInterceptor(errOut))},
+	}
+	if endpoint != "" {
+		if pf := c.Endpoint.PortForward; pf != nil && opts.KubeContext == "" {
+			opts.KubeContext = pf.KubeContext
+		}
+		c.Endpoint = ateconfig.Endpoint{Address: endpoint}
+	}
+	warnSharedIdentity(errOut, c, tokenFile)
 
+	if source == "" {
+		source = "default"
+	}
 	if verbosity >= vFlow {
-		vlogf(errOut, vFlow, "Connecting to ate-api-server (endpoint=%q, kubeconfig=%q, context=%q, token-file=%q, trace=%t)",
-			endpoint, kubeconfig, k8sContext, tokenFile, traceEnabled)
-	} else if endpoint != "" {
-		vlogf(errOut, vBasic, "Connecting to ate-api-server at %s", endpoint)
+		vlogf(errOut, vFlow, "Connecting to ate-api-server (ateconfig=%q, context=%q, endpoint=%q, kubeconfig=%q, kube-context=%q, token-file=%q, trace=%t)",
+			source, c.Name, endpoint, kubeconfig, k8sContext, tokenFile, traceEnabled)
+	} else if c.Endpoint.Address != "" {
+		vlogf(errOut, vBasic, "Connecting to ate-api-server at %s", c.Endpoint.Address)
 	} else {
 		vlogf(errOut, vBasic, "Connecting to ate-api-server via port-forward")
 	}
 
 	start := time.Now()
-	cli, err := ateclient.NewClient(
-		ctx, kubeconfig, k8sContext, endpoint, tokenFile, traceEnabled,
-		grpc.WithChainUnaryInterceptor(newLoggingUnaryInterceptor(errOut)),
-	)
+	cli, err := ateclient.Dial(ctx, c, opts)
 	elapsed := time.Since(start).Round(time.Millisecond)
 	if err != nil {
 		vlogf(errOut, vBasic, "Connection to ate-api-server failed after %s: %v", elapsed, err)
@@ -109,12 +127,13 @@ func newAPIClient(cmd *cobra.Command) (*ateclient.Client, error) {
 // warnSharedIdentity warns on errOut when the command will act as the shared
 // fallback ServiceAccount rather than as the user. Everyone relying on the
 // fallback is the same principal, holding whatever that principal is granted:
-// global owner wherever the install names it a bootstrap owner.
-func warnSharedIdentity(errOut io.Writer, tokenFile string) {
-	if tokenFile != "" {
+// global owner wherever the install names it a bootstrap owner. An exec
+// plugin's identity is unknown here; `kubectl ate credential` warns itself.
+func warnSharedIdentity(errOut io.Writer, c *ateconfig.Context, tokenFile string) {
+	if tokenFile != "" || c.Credential.Exec != nil || c.Credential.TokenFile != "" {
 		return
 	}
-	fmt.Fprintf(errOut, "Warning: no --token-file given; acting as the shared identity %s rather than as yourself. Pass --token-file to act as yourself.\n",
+	fmt.Fprintf(errOut, "Warning: no credential configured; acting as the shared identity %s rather than as yourself. Pass --token-file, or configure a credential with `kubectl ate config init`, to act as yourself.\n",
 		ateclient.FallbackPrincipal())
 }
 

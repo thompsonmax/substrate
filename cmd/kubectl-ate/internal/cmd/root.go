@@ -28,14 +28,15 @@ import (
 )
 
 var (
-	kubeconfig   string
-	k8sContext   string
-	endpoint     string
-	tokenFile    string
-	outputFmt    string
-	traceEnabled bool
-	verbosity    int
-	usePreview   bool
+	ateconfigPath string
+	kubeconfig    string
+	k8sContext    string
+	endpoint      string
+	tokenFile     string
+	outputFmt     string
+	traceEnabled  bool
+	verbosity     int
+	usePreview    bool
 )
 
 var rootCmd = &cobra.Command{
@@ -103,8 +104,9 @@ func init() {
 	))
 
 	// Persistent flags are available to this command and all subcommands
-	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "path to the kubeconfig file")
-	rootCmd.PersistentFlags().StringVar(&k8sContext, "context", "", "kubeconfig context to use")
+	rootCmd.PersistentFlags().StringVar(&ateconfigPath, "ateconfig", "", "path to the AteConfig file (defaults to $ATECONFIG, then ~/.ate/config)")
+	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "path to the kubeconfig file; reaches ate-api through it instead of the AteConfig")
+	rootCmd.PersistentFlags().StringVar(&k8sContext, "context", "", "kubeconfig context to use; reaches ate-api through it instead of the AteConfig")
 	rootCmd.PersistentFlags().StringVar(&endpoint, "endpoint", "", "manual override for the gRPC target (e.g., localhost:8080); if omitted, automatically port-forwards")
 	rootCmd.PersistentFlags().StringVar(&tokenFile, "token-file", "", "path to a bearer token for ate-api authentication, or - for stdin (defaults to a Kubernetes ServiceAccount token)")
 	rootCmd.PersistentFlags().StringVarP(&outputFmt, "output", "o", "table", "output format: table, json, or yaml")

@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"go.ate.dev/substrate/internal/ateclient"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -31,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 )
 
@@ -289,9 +291,9 @@ func TestTopWorkersRunner_VerboseSurfacesMetricsIssues(t *testing.T) {
 }
 
 func TestWarnSharedIdentity(t *testing.T) {
-	t.Run("warns without a token file", func(t *testing.T) {
+	t.Run("warns without a credential", func(t *testing.T) {
 		var buf bytes.Buffer
-		warnSharedIdentity(&buf, "")
+		warnSharedIdentity(&buf, ateclient.DefaultContext(""), "")
 		got := buf.String()
 		for _, want := range []string{"Warning:", "ate-client", "shared identity", "--token-file"} {
 			if !strings.Contains(got, want) {
@@ -301,7 +303,16 @@ func TestWarnSharedIdentity(t *testing.T) {
 	})
 	t.Run("silent with a token file", func(t *testing.T) {
 		var buf bytes.Buffer
-		warnSharedIdentity(&buf, "/path/to/token")
+		warnSharedIdentity(&buf, ateclient.DefaultContext(""), "/path/to/token")
+		if got := buf.String(); got != "" {
+			t.Errorf("warning = %q, want none", got)
+		}
+	})
+	t.Run("silent with a configured credential", func(t *testing.T) {
+		var buf bytes.Buffer
+		c := ateclient.DefaultContext("")
+		c.Credential.Exec = &clientcmdapi.ExecConfig{Command: "plugin"}
+		warnSharedIdentity(&buf, c, "")
 		if got := buf.String(); got != "" {
 			t.Errorf("warning = %q, want none", got)
 		}

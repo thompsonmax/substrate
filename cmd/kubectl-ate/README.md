@@ -21,10 +21,51 @@ If you are testing changes to the codebase, you can bypass compilation and run t
 go run ./cmd/kubectl-ate <command>
 ```
 
-## Connection & Auto Port-Forwarding
-By default, `kubectl-ate` will automatically read your `~/.kube/config`, discover the `ate-api-server` pods in your cluster, and establish a temporary background port-forward tunnel to execute gRPC calls securely.
+## Connection & Authentication
+`kubectl-ate` reads an AteConfig file from `--ateconfig`, then `$ATECONFIG`, then `~/.ate/config`. Each context in it says how to reach ate-api, how to verify it, and which credential to send:
 
-If you prefer to route traffic directly (e.g., through a LoadBalancer or when running natively inside a cluster pod), simply provide the `--endpoint` flag to bypass the tunnel.
+```yaml
+apiVersion: ate.dev/v1alpha1
+kind: AteConfig
+currentContext: prod
+contexts:
+- name: prod
+  endpoint:
+    portForward: {kubeContext: gke_proj_us-central1_prod, namespace: ate-system, service: api}
+    # address: ate.example.com:443     # dial directly instead
+  tlsServerName: api.ate-system.svc
+  audience: api.ate-system.svc         # passed to the plugin as spec.cluster.config.audience
+  # certificateAuthorityData: LS0t...  # otherwise read from the cluster's ClusterTrustBundle
+  credential:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1
+      command: kubectl-ate
+      args: [credential, --context=gke_proj_us-central1_prod]
+      interactiveMode: Never
+      provideClusterInfo: true
+    # tokenFile: /var/run/secrets/ate/token   # re-read on every RPC
+```
+
+`credential.exec` is a kubeconfig exec stanza, so any kubectl credential plugin works there, such as kubelogin. The client caches the plugin's token until its `expirationTimestamp`, and runs the plugin again when ate-api rejects the token. If a context sets no credential, the client mints a token for the shared `ate-client` ServiceAccount.
+
+With no AteConfig file, or when `--kubeconfig` or `--context` is passed, `kubectl-ate` port-forwards through that kubeconfig context to the `api` Service in `ate-system` and authenticates as `ate-client`. `--endpoint` dials an address directly for a single command.
+
+```bash
+# Add a context for the current kubeconfig context and make it current
+kubectl ate config init
+
+# Authenticate as your own ServiceAccount (see docs/authentication.md)
+kubectl ate config init --service-account=ate-users/alice
+
+kubectl ate config view
+kubectl ate config use-context prod
+
+# Show the principal ate-api authenticated you as
+kubectl ate whoami
+
+# Print a raw bearer token, e.g. for grpcurl
+kubectl ate credential -o token
+```
 
 ## Tracing
 The CLI supports on-demand tracing using the `--trace` flag. When enabled, the CLI will generate a trace ID and signal to the server that it wants the request to be traced.
@@ -63,10 +104,11 @@ These flags can be appended to any command:
 
 | Flag | Short | Description | Default |
 |---|---|---|---|
-| `--kubeconfig` | | Path to your kubeconfig file | `~/.kube/config` |
-| `--context` | | Name of the kubeconfig context to use | current context |
+| `--ateconfig` | | Path to the AteConfig file | `$ATECONFIG`, then `~/.ate/config` |
+| `--kubeconfig` | | Path to your kubeconfig file; reaches ate-api through it instead of the AteConfig | `~/.kube/config` |
+| `--context` | | Name of the kubeconfig context to use; reaches ate-api through it instead of the AteConfig | current context |
 | `--endpoint` | | Manual gRPC endpoint override (e.g., `localhost:8080`) | |
-| `--token-file` | | Path to a bearer token for ate-api authentication, or `-` for stdin | Kubernetes ServiceAccount token |
+| `--token-file` | | Path to a bearer token for ate-api authentication, or `-` for stdin; replaces the context's credential | the context's credential |
 | `--output` | `-o` | Output format (`table`, `json`, `yaml`) | `table` |
 | `--trace` | | Enable on-demand tracing for the request | `false` |
 | `--verbose` | `-v` | Increase output verbosity; may be repeated or stacked (e.g., `-v`, `-vv`, `-vvvvv`) | `0` |
